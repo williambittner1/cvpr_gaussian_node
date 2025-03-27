@@ -442,10 +442,11 @@ class GaussianModel:
         self._rotation = new_rotations.to(self.device)
 
 
-    def update_gaussians(self, new_xyz, new_rot):
+    def update_gaussians(self, new_xyz, new_rot, scaling_factor=1.0):
 
         self._xyz = new_xyz.to(self.device)
         self._rotation = new_rot.to(self.device)
+        self._scaling = self._scaling*scaling_factor
 
         # labels = self.cluster_label.squeeze()  # shape: (N,)
         

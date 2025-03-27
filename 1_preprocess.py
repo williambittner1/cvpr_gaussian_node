@@ -38,7 +38,7 @@ class ExperimentConfig:
 @dataclass
 class OptimizationConfig:
     """Configuration for optimization parameters."""
-    iterations: int = 12_000
+    iterations: int = 30_000
     position_lr_init: float = 0.00016
     position_lr_final: float = 0.0000016
     position_lr_delay_mult: float = 0.01
@@ -63,6 +63,8 @@ class OptimizationConfig:
     random_background: bool = False
     optimizer_type: str = "default"
     semantic_feature_lr: float = 0.001  # Learning rate for semantic features
+    noise_scale: float = 1.0  # Scaling factor for annealing noise (Nε)
+    noise_end_iter: int = 10000  # Iteration at which noise reaches zero
 
 @dataclass
 class ModelConfig:
@@ -100,6 +102,8 @@ def flatten_dataclass(cls):
                                 getattr(getattr(self, field_name), nested_field_name)
                             )
                         setattr(cls, nested_field.name, make_property(field.name, nested_field.name))
+                        # Also set the attribute directly for easier access
+                        setattr(cls, nested_field.name, getattr(nested_obj, nested_field.name))
     
     cls.__init__ = __init__
     return cls
@@ -112,6 +116,17 @@ class Config:
     optimization: OptimizationConfig = OptimizationConfig()
     model: ModelConfig = ModelConfig()
     pipeline: PipelineConfig = PipelineConfig()
+    
+    # Add direct attributes for commonly accessed nested values
+    data_device: str = field(init=False)
+    dataset_path: str = field(init=False)
+    gm_output_path: str = field(init=False)
+    
+    def __post_init__(self):
+        # Set direct attributes from nested experiment config
+        self.data_device = self.experiment.data_device
+        self.dataset_path = self.experiment.dataset_path
+        self.gm_output_path = self.experiment.gm_output_path
 
 
 def select_random_camera(scene: Scene) -> Any:
@@ -183,6 +198,74 @@ def densification_step(
         gaussians.reset_opacity()
 
 
+def log_gaussian_distributions(gaussians: GaussianModel, iteration: int, loss: float) -> None:
+    """Log distributions of gaussian parameters to wandb."""
+    # Compute opacity and scale distributions
+    opacities = gaussians.get_opacity.detach().cpu().numpy()
+    scales = gaussians.get_scaling.detach().cpu().numpy()
+    
+    # Create histograms
+    opacity_hist, opacity_bins = np.histogram(opacities, bins=50, range=(0, 1))
+    scale_hist, scale_bins = np.histogram(scales, bins=50)
+    
+    # Compute CDFs
+    opacity_cdf = np.cumsum(opacity_hist) / len(opacities)
+    scale_cdf = np.cumsum(scale_hist) / len(scales)
+    
+    # Log distributions to wandb
+    wandb.log({
+        "loss": loss.item(),
+        "num_gaussians": len(gaussians._xyz),
+        "iteration": iteration,
+        "opacity_histogram": wandb.Histogram(np_histogram=(opacity_hist, opacity_bins)),
+        "scale_histogram": wandb.Histogram(np_histogram=(scale_hist, scale_bins)),
+        "opacity_cdf": wandb.plot.line_series(
+            xs=[opacity_bins[:-1].tolist()],
+            ys=[opacity_cdf.tolist()],
+            keys=["CDF"],
+            title="Opacity CDF"
+        ),
+        "scale_cdf": wandb.plot.line_series(
+            xs=[scale_bins[:-1].tolist()],
+            ys=[scale_cdf.tolist()],
+            keys=["CDF"],
+            title="Scale CDF"
+        ),
+        "opacity_stats": {
+            "mean": float(np.mean(opacities)),
+            "std": float(np.std(opacities)),
+            "min": float(np.min(opacities)),
+            "max": float(np.max(opacities)),
+            "median": float(np.median(opacities))
+        },
+        "scale_stats": {
+            "mean": float(np.mean(scales)),
+            "std": float(np.std(scales)),
+            "min": float(np.min(scales)),
+            "max": float(np.max(scales)),
+            "median": float(np.median(scales))
+        }
+    })
+
+def apply_annealing_noise(xyz: torch.Tensor, iteration: int, config: OptimizationConfig) -> torch.Tensor:
+    """Apply annealing noise to the gaussian positions.
+    
+    Args:
+        xyz: Tensor of gaussian positions (N, 3)
+        iteration: Current training iteration
+        config: Optimization config containing noise parameters
+        
+    Returns:
+        Tensor of noised positions (N, 3)
+    """
+    # Compute noise scale that decreases linearly until noise_end_iter
+    noise_factor = 1.0 - min(1.0, iteration / config.noise_end_iter)
+    
+    # Generate random noise
+    noise = torch.randn_like(xyz, device=xyz.device) * config.noise_scale * noise_factor
+    
+    return xyz + noise
+
 def train_static_gaussian_model(
     scene: Scene,
     config: Config,
@@ -221,6 +304,11 @@ def train_static_gaussian_model(
         viewpoint_cam = select_random_camera(scene)
         cam_idx = viewpoint_cam.uid
         
+        # Apply annealing noise to gaussian positions
+        noised_xyz = apply_annealing_noise(scene.gaussians._xyz, iteration, config.optimization)
+        original_xyz = scene.gaussians._xyz.clone()
+        scene.gaussians._xyz.data.copy_(noised_xyz)
+        
         # Render
         render_pkg = render(viewpoint_cam, scene.gaussians, config.pipeline, bg_color)
         rendered_image = render_pkg["render"]
@@ -229,7 +317,22 @@ def train_static_gaussian_model(
         gt_image = gt_images[cam_idx]
         loss = F.mse_loss(rendered_image, gt_image)
         
+        # Log basic metrics every iteration
+        wandb.log({
+            "loss": loss.item(),
+            "num_gaussians": len(scene.gaussians._xyz),
+            "iteration": iteration,
+            "noise_scale": config.optimization.noise_scale * (1.0 - min(1.0, iteration / config.optimization.noise_end_iter))
+        })
+        
+        # Log detailed distributions every 1000th iteration
+        if iteration % 1000 == 0:
+            log_gaussian_distributions(scene.gaussians, iteration, loss)
+        
         loss.backward()
+        
+        # Restore original positions before optimizer step
+        scene.gaussians._xyz.data.copy_(original_xyz)
 
         scene.gaussians.update_learning_rate(iteration)
         scene.gaussians.optimizer.step()
@@ -319,16 +422,29 @@ class PreprocessingDataset(Dataset):
         self.dataset_path = config.experiment.dataset_path
         self.to_tensor = T.ToTensor()
 
-        self.scene_dirs = sorted([
-            os.path.join(self.dataset_path, d)
-            for d in os.listdir(self.dataset_path)
-            if os.path.isdir(os.path.join(self.dataset_path, d)) and d.startswith("sequence")
+        # Find sequence directories in train and test subdirectories
+        train_path = os.path.join(self.dataset_path, "train")
+        test_path = os.path.join(self.dataset_path, "test")
+        
+        train_sequences = sorted([
+            os.path.join(train_path, d)
+            for d in os.listdir(train_path)
+            if os.path.isdir(os.path.join(train_path, d)) and d.startswith("sequence")
         ])
+        
+        test_sequences = sorted([
+            os.path.join(test_path, d)
+            for d in os.listdir(test_path)
+            if os.path.isdir(os.path.join(test_path, d)) and d.startswith("sequence")
+        ])
+        
+        self.scene_dirs = train_sequences + test_sequences
 
         if not self.scene_dirs:
             raise ValueError(
-                f"No scene directories found in {self.dataset_path}. "
-                "Make sure your data folder has subdirectories named like 'sequence1', 'sequence2', etc."
+                f"No scene directories found in {train_path} or {test_path}. "
+                "Make sure your data folder has subdirectories named like 'sequence0001', 'sequence0002', etc. "
+                "under both train/ and test/ directories."
             )
 
     def __len__(self) -> int:

@@ -37,7 +37,7 @@ class Config:
         
         # Training parameters
         self.framerate = 25  # Samples per second
-        self.wandb_fps = 10
+        self.wandb_fps = 5
         self.initial_segment_length_seconds = 0.2
         self.num_timestep_samples = 5
         self.num_train_sequences = 1
@@ -64,7 +64,7 @@ class Config:
         self.ode_atol = 1e-4
         
         # Visualization
-        self.train_visualization_interval = 100
+        self.train_visualization_interval = 50
         self.test_visualization_interval = 100
         self.test_loss_interval = 100
         
@@ -78,6 +78,10 @@ class Config:
         # Rigidity
         self.rigidity_sample_size = 100
         self.rigidity_neighbors = 3
+        
+        # Annealing noise parameters
+        self.noise_scale = .01  # Scaling factor Nε for annealing noise
+        self.noise_end_iter = 10000  # Iteration at which noise reaches zero
         
         # Logging
         self.use_wandb = True  # Flag to control wandb usage
@@ -124,6 +128,89 @@ class QuaternionOps:
         R[:, 2, 2] = ww - xx - yy + zz
         
         return R
+
+    @staticmethod
+    def exp(omega: torch.Tensor) -> torch.Tensor:
+        """Compute quaternion exponential map.
+        
+        Args:
+            omega: Angular velocity tensor of shape [..., 3]
+            
+        Returns:
+            Quaternion tensor of shape [..., 4]
+        """
+        # Compute angle (magnitude of angular velocity)
+        theta = torch.norm(omega, dim=-1, keepdim=True)
+        
+        # Handle small angles (Taylor series approximation)
+        small_angle_mask = theta < 1e-6
+        theta = torch.where(small_angle_mask, torch.ones_like(theta), theta)
+        
+        # Compute sin(theta/2) and cos(theta/2)
+        sin_half = torch.sin(0.5 * theta)
+        cos_half = torch.cos(0.5 * theta)
+        
+        # Normalize angular velocity for direction
+        omega_norm = omega / (theta + 1e-8)
+        
+        # Construct quaternion [cos(theta/2), sin(theta/2) * omega_norm]
+        quat = torch.cat([
+            cos_half,
+            sin_half * omega_norm[..., 0:1],
+            sin_half * omega_norm[..., 1:2],
+            sin_half * omega_norm[..., 2:3]
+        ], dim=-1)
+        
+        # For very small angles, use first-order approximation
+        quat = torch.where(
+            small_angle_mask.expand_as(quat),
+            torch.cat([
+                torch.ones_like(cos_half),
+                0.5 * omega[..., 0:1],
+                0.5 * omega[..., 1:2],
+                0.5 * omega[..., 2:3]
+            ], dim=-1),
+            quat
+        )
+        
+        return quat
+
+    @staticmethod
+    def log(q: torch.Tensor) -> torch.Tensor:
+        """Compute quaternion logarithm map.
+        
+        Args:
+            q: Quaternion tensor of shape [..., 4]
+            
+        Returns:
+            Angular velocity tensor of shape [..., 3]
+        """
+        # Extract scalar and vector parts
+        w = q[..., 0:1]
+        v = q[..., 1:]
+        
+        # Compute angle
+        theta = 2 * torch.acos(torch.clamp(w, -1.0, 1.0))
+        
+        # Handle small angles
+        small_angle_mask = theta < 1e-6
+        theta = torch.where(small_angle_mask, torch.ones_like(theta), theta)
+        
+        # Compute normalized vector part
+        v_norm = torch.norm(v, dim=-1, keepdim=True)
+        v_normalized = v / (v_norm + 1e-8)
+        
+        # Compute logarithm
+        omega = theta * v_normalized
+        
+        # For very small angles, use first-order approximation
+        omega = torch.where(
+            small_angle_mask.expand_as(omega),
+            2 * v,
+            omega
+        )
+        
+        return omega
 
 # --------------------------
 # Neural Network Components
@@ -177,12 +264,11 @@ class ResidualMLP(nn.Module):
 # --------------------------
 class ODEFunc(nn.Module):
     """Neural ODE function."""
-    def __init__(self, latent_dim: int = 128, num_layers: int = 4, hidden_dim: int = 128):
+    def __init__(self, latent_dim: int = 128, num_layers: int = 4, hidden_dim: int = 256):
         super().__init__()
         self.nfe = 0
         
         # Single unified network for both velocity and angular velocity
-        # self.dynamics_net = MLP(13 + latent_dim + 1, 6, hidden_dim=hidden_dim, num_layers=num_layers)
         self.dynamics_net = ResidualMLP(13+latent_dim + 1, 6, hidden_dim=hidden_dim, num_layers=num_layers)
         
         # Regularization terms
@@ -218,10 +304,9 @@ class ODEFunc(nn.Module):
         omega_norm = torch.norm(dt_omega, dim=-1).mean()
         # self.reg_loss = 0.01 * (vel_norm + omega_norm)  # L1 regularization to promote sparsity
         
-        # Quaternion derivative
+        # Quaternion derivative using exponential map
         omega = z[..., 10:13]
-        omega_quat = torch.cat([torch.zeros_like(omega[..., :1]), omega], dim=-1)
-        dt_quat = 0.5 * QuaternionOps.multiply(quat, omega_quat)
+        dt_quat = QuaternionOps.exp(omega)  # This gives us the quaternion derivative
         
         # Latent derivative is zero
         dt_latent = torch.zeros_like(z[..., 13:])
@@ -280,7 +365,7 @@ class LatentNeuralODE(nn.Module):
         z_traj = odeint(self.func, z0, t_span, 
                         method=self.method, atol=self.atol, rtol=self.rtol,
                         options={'max_num_steps': 1000})  # Add explicit maximum steps for adaptive methods
-        return z_traj
+        return z_traj # xyz(0:3), quat(3:7), vel(7:10), omega(10:13), latent(13:)
 
 # --------------------------
 # Data Loading
@@ -450,6 +535,8 @@ class GMDataset(Dataset):
     def __init__(self, config: Config, num_sequences: int, dataset_path: str):
         self.config = config
         self.dataset_path = dataset_path
+        
+        # Find sequence directories in the specified path
         self.scene_dirs = sorted(
             os.path.join(dataset_path, d)
             for d in os.listdir(dataset_path)
@@ -457,7 +544,10 @@ class GMDataset(Dataset):
         )[:num_sequences]
         
         if not self.scene_dirs:
-            raise ValueError(f"No valid scene directories found in {dataset_path}")
+            raise ValueError(
+                f"No scene directories found in {dataset_path}. "
+                f"Make sure your data folder has subdirectories named like 'sequence0001', 'sequence0002', etc."
+            )
             
         self.scenes_data = [SceneData(config, d) for d in self.scene_dirs]
         
@@ -554,7 +644,7 @@ def visualize_results(loader: DataLoader, processor: nn.Module, config: Config,
                 segment_length, device=device
             ))[..., :13]
             
-            for cam_idx in range(10):  # First 10 cameras
+            for cam_idx in range(3):  # First 10 cameras
                 # Load ground truth
                 gt_frames = []
                 for t in range(segment_length):
@@ -659,6 +749,70 @@ def map_gradients_to_rgb(gradients: torch.Tensor) -> torch.Tensor:
     rgb = rgb * intensity
     return rgb
 
+def log_loss_components(loss_components: Dict[str, List[float]], seq_idx: int, step: int, config: Config):
+    """Log individual loss components to wandb.
+    
+    Args:
+        loss_components: Dictionary containing lists of loss values for each component
+        seq_idx: Index of the sequence
+        step: Current training step
+        config: Configuration object
+    """
+    if config.use_wandb:
+        wandb.log({
+            f"gradient_mse_loss_seq{seq_idx}": np.mean(loss_components['mse']),
+            f"gradient_ssim_loss_seq{seq_idx}": np.mean(loss_components['ssim']),
+            f"gradient_lpips_loss_seq{seq_idx}": np.mean(loss_components['lpips'])
+        }, step=step)
+
+def smooth_gradients(gradients: torch.Tensor, positions: torch.Tensor, radius: float = 0.1, num_neighbors: int = 5) -> torch.Tensor:
+    """Smooth gradients based on spatial proximity of gaussians.
+    
+    Args:
+        gradients: Tensor of shape [N, 3] containing xyz gradients
+        positions: Tensor of shape [N, 3] containing xyz positions
+        radius: Maximum distance to consider for neighbors
+        num_neighbors: Maximum number of neighbors to consider
+        
+    Returns:
+        Smoothed gradients of shape [N, 3]
+    """
+    N = positions.shape[0]
+    
+    # Compute pairwise distances between all gaussians
+    # Reshape positions for broadcasting: [N, 1, 3] - [1, N, 3] = [N, N, 3]
+    pos_diff = positions.unsqueeze(1) - positions.unsqueeze(0)  # [N, N, 3]
+    distances = torch.norm(pos_diff, dim=2)  # [N, N]
+    
+    # Create mask for neighbors within radius
+    neighbor_mask = distances < radius  # [N, N]
+    
+    # For each gaussian, get indices of its neighbors
+    neighbor_indices = torch.where(neighbor_mask)  # Tuple of (row_indices, col_indices)
+    
+    # Initialize smoothed gradients
+    smoothed_grads = torch.zeros_like(gradients)
+    
+    # For each gaussian, average its gradient with its neighbors
+    for i in range(N):
+        # Get indices of neighbors for this gaussian
+        neighbor_cols = neighbor_indices[1][neighbor_indices[0] == i]
+        
+        # Limit number of neighbors if needed
+        if len(neighbor_cols) > num_neighbors:
+            # Sort by distance and take closest neighbors
+            neighbor_dists = distances[i, neighbor_cols]
+            _, closest_indices = torch.topk(neighbor_dists, num_neighbors, largest=False)
+            neighbor_cols = neighbor_cols[closest_indices]
+        
+        # Include the gaussian itself in the averaging
+        indices_to_average = torch.cat([torch.tensor([i], device=gradients.device), neighbor_cols])
+        
+        # Average gradients
+        smoothed_grads[i] = gradients[indices_to_average].mean(dim=0)
+    
+    return smoothed_grads
+
 def visualize_gradients(loader: DataLoader, processor: nn.Module, config: Config,
                     device: torch.device, background: torch.Tensor,
                     segment_length: int, dataset: GMDataset, step: int, lpips_model: Optional[nn.Module] = None) -> Dict[str, Any]:
@@ -685,11 +839,6 @@ def visualize_gradients(loader: DataLoader, processor: nn.Module, config: Config
         
         # Generate visualization frames with gradient colors
         grad_frames = []
-        loss_components = {
-            'mse': [],
-            'ssim': [],
-            'lpips': []
-        }
         
         for t in range(segment_length):
             # Create fresh gaussian model for this timestep
@@ -717,18 +866,8 @@ def visualize_gradients(loader: DataLoader, processor: nn.Module, config: Config
                         temp_gaussians, config.pipeline, background
                     )["render"]
                     
-                    # Compute individual loss components
-                    mse_loss = F.mse_loss(render, gt)
-                    ssim_loss = compute_ssim_loss(render, gt)
-                    lpips_loss = compute_lpips_loss(render, gt, lpips_model) if lpips_model is not None else torch.tensor(0.0, device=device)
-                    
-                    # Store loss components
-                    loss_components['mse'].append(mse_loss.item())
-                    loss_components['ssim'].append(ssim_loss.item())
-                    loss_components['lpips'].append(lpips_loss.item())
-                    
                     # Compute total loss
-                    loss = compute_loss(render, gt, lpips_model)
+                    loss, _ = compute_loss(render, gt, lpips_model)
                     losses.append(loss)
             
             if losses:
@@ -736,13 +875,20 @@ def visualize_gradients(loader: DataLoader, processor: nn.Module, config: Config
                 total_loss.backward()
                 pos_grads = temp_gaussians._xyz.grad
                 if pos_grads is not None:
-                    grad_colors = map_gradients_to_rgb(pos_grads)
+                    # Smooth the gradients based on spatial proximity
+                    smoothed_grads = smooth_gradients(
+                        pos_grads,
+                        xyz,
+                        radius=0.1,  # Adjust this value based on your scene scale
+                        num_neighbors=5  # Adjust this value based on your needs
+                    )
+                    temp_gaussians._xyz.grad = smoothed_grads
                     
                     # Render with gradient colors for first camera only
                     grad_render = render_batch(
                         [scene.getTrainCameraObjects()[0]],
                         temp_gaussians, config.pipeline, background,
-                        override_color=grad_colors
+                        override_color=map_gradients_to_rgb(smoothed_grads)
                     )["render"].squeeze(0).detach().cpu().numpy()
                     
                     grad_frames.append(grad_render)
@@ -758,14 +904,6 @@ def visualize_gradients(loader: DataLoader, processor: nn.Module, config: Config
             video_logs[f"gradient_visualization_seq{i}"] = wandb.Video(
                 grad_video, fps=config.wandb_fps, format="mp4"
             )
-            
-            # Log average loss components
-            if config.use_wandb:
-                wandb.log({
-                    f"gradient_mse_loss_seq{i}": np.mean(loss_components['mse']),
-                    f"gradient_ssim_loss_seq{i}": np.mean(loss_components['ssim']),
-                    f"gradient_lpips_loss_seq{i}": np.mean(loss_components['lpips'])
-                }, step=step)
     
     if config.use_wandb:
         wandb.log(video_logs, step=step)
@@ -907,7 +1045,7 @@ def compute_lpips_loss(pred: torch.Tensor, gt: torch.Tensor, lpips_model: nn.Mod
     return lpips_model(pred, gt).mean()
 
 def compute_loss(pred: torch.Tensor, gt: torch.Tensor, lpips_model: Optional[nn.Module] = None,
-                reduction: str = 'mean', weights: Optional[Dict[str, float]] = None) -> torch.Tensor:
+                reduction: str = 'mean', weights: Optional[Dict[str, float]] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Compute combined loss between predicted and ground truth images.
     
     Args:
@@ -918,7 +1056,9 @@ def compute_loss(pred: torch.Tensor, gt: torch.Tensor, lpips_model: Optional[nn.
         weights: Optional dictionary of loss weights
         
     Returns:
-        Combined loss tensor
+        Tuple containing:
+        - Combined loss tensor
+        - Dictionary of individual loss components (mse, ssim, lpips)
     """
     # Default weights if not provided
     if weights is None:
@@ -932,12 +1072,20 @@ def compute_loss(pred: torch.Tensor, gt: torch.Tensor, lpips_model: Optional[nn.
     mse_loss = F.mse_loss(pred, gt, reduction=reduction)
     
     # SSIM loss
-    ssim_loss = compute_ssim_loss(pred, gt)
+    ssim_loss = torch.tensor(0.0, device=pred.device)
+    # ssim_loss = compute_ssim_loss(pred, gt)
     
     # LPIPS loss if model is provided
     lpips_loss = torch.tensor(0.0, device=pred.device)
-    if lpips_model is not None:
-        lpips_loss = compute_lpips_loss(pred, gt, lpips_model)
+    # if lpips_model is not None:
+    #     lpips_loss = compute_lpips_loss(pred, gt, lpips_model)
+    
+    # Store individual losses
+    loss_components = {
+        'mse': weights['mse'] * mse_loss,
+        'ssim': weights['ssim'] * ssim_loss,
+        'lpips': weights['lpips'] * lpips_loss
+    }
     
     # Combine losses with weights
     total_loss = (
@@ -945,8 +1093,8 @@ def compute_loss(pred: torch.Tensor, gt: torch.Tensor, lpips_model: Optional[nn.
         weights['ssim'] * ssim_loss +
         weights['lpips'] * lpips_loss
     )
-    
-    return total_loss
+
+    return total_loss, loss_components
 
 def compute_per_pixel_loss(pred: torch.Tensor, gt: torch.Tensor, lpips_model: Optional[nn.Module] = None) -> torch.Tensor:
     """Compute per-pixel combined loss between predicted and ground truth images.
@@ -1050,6 +1198,101 @@ def visualize_loss(loader: DataLoader, processor: nn.Module, config: Config,
         wandb.log(video_logs, step=step)
     return video_logs
 
+def visualize_downscaled_gaussians(loader: DataLoader, processor: nn.Module, config: Config,
+                    device: torch.device, background: torch.Tensor,
+                    segment_length: int, dataset: GMDataset, step: int,
+                    is_test: bool = False) -> Dict[str, Any]:
+    """Generate and log visualization videos with downscaled gaussians."""
+    video_logs = {}
+    batch = next(iter(loader))
+    
+    with torch.no_grad():
+        for i in range(len(batch['GM0'])):
+            scene = batch['scene'][i]
+            GM0 = batch['GM0'][i]
+            
+            # Get initial state
+            xyz0 = GM0._xyz.detach()
+            rot0 = GM0._rotation.detach()
+            
+            # Concatenate position and rotation
+            z0 = torch.cat([xyz0, rot0], dim=-1).unsqueeze(0)  # Shape: [1, num_points, 7]
+            
+            # Generate trajectory
+            z_traj = processor(z0, torch.linspace(
+                0, segment_length/config.framerate, 
+                segment_length, device=device
+            ))[..., :13]
+            
+            for cam_idx in range(3):  # First 10 cameras
+                # Load ground truth
+                gt_frames = []
+                for t in range(segment_length):
+                    frame = dataset.scenes_data[i].get_frame(t, cam_idx, for_training=False)
+                    if frame is not None:
+                        gt_frames.append(frame.cpu())
+                
+                if not gt_frames:
+                    continue
+                    
+                gt_video = torch.stack(gt_frames).numpy()  # [T, 3, H, W]
+                
+                # Generate predictions with downscaled gaussians
+                pred_frames = []
+                for t in range(segment_length):
+                    xyz = z_traj[t, 0, :, :3]
+                    quat = F.normalize(z_traj[t, 0, :, 3:7], dim=-1)
+                    
+                    temp_gaussians = GM0.clone()
+                    # Update gaussians with downscaled scaling
+                    temp_gaussians.update_gaussians(xyz, quat, scaling_factor=4.0)
+                    
+                    render = render_batch(
+                        [scene.getTrainCameraObjects()[cam_idx]],
+                        temp_gaussians, config.pipeline, background
+                    )["render"].squeeze(0).cpu().numpy()
+                    
+                    pred_frames.append(render)
+                
+                # Combine and log videos
+                pred_video = np.stack(pred_frames)  # [T, 3, H, W]
+                combined = create_side_by_side_video(pred_video, gt_video)
+                prefix = "test" if is_test else "train"
+                
+                # Log videos in wandb format
+                video_logs[f"{prefix}_downscaled_comparison_seq{i}_cam{cam_idx}"] = wandb.Video(
+                    combined, fps=config.wandb_fps, format="mp4"
+                )
+    
+    if config.use_wandb:
+        wandb.log(video_logs, step=step)
+    return video_logs
+
+def apply_annealing_noise(z0: torch.Tensor, iteration: int, config: Config) -> torch.Tensor:
+    """Apply annealing noise to the input state z0.
+    
+    Args:
+        z0: Input state tensor of shape [batch_size, num_points, feature_dim]
+        iteration: Current training iteration
+        config: Configuration object containing noise parameters
+        
+    Returns:
+        Noised state tensor of same shape as input
+    """
+    # Compute noise scale that decreases linearly until noise_end_iter
+    noise_factor = 1.0 - min(1.0, iteration / config.noise_end_iter)
+    
+    # Generate random noise for position and rotation components
+    pos_noise = torch.randn_like(z0[..., :3], device=z0.device) * config.noise_scale * noise_factor
+    rot_noise = torch.randn_like(z0[..., 3:7], device=z0.device) * config.noise_scale * noise_factor * 0.1  # Less noise for rotations
+    
+    # Create noised version
+    noised_z0 = z0.clone()
+    noised_z0[..., :3] = z0[..., :3] + pos_noise
+    noised_z0[..., 3:7] = F.normalize(z0[..., 3:7] + rot_noise, dim=-1)  # Ensure quaternions stay normalized
+    
+    return noised_z0
+
 # --------------------------
 # Training Loop
 # --------------------------
@@ -1060,7 +1303,7 @@ def train(config: Config):
     t_span = torch.linspace(0, config.num_timestep_samples/config.framerate, 
                             config.num_timestep_samples, device=device)
     
-    # Initialize datasets
+    # Initialize datasets with correct paths
     train_dataset = GMDataset(config, config.num_train_sequences, f"{config.dataset_path}/train")
     test_dataset = GMDataset(config, config.num_test_sequences, f"{config.dataset_path}/test")
     
@@ -1120,6 +1363,13 @@ def train(config: Config):
         decaying_grad_norms = []
         other_grad_norms = []
         
+        # Initialize loss components tracking for this epoch
+        epoch_loss_components = {
+            'mse': [],
+            'ssim': [],
+            'lpips': []
+        }
+        
         # Update learning rate for decaying parameters
         decaying_lr_scale *= config.decaying_params_lr_decay
         optimizer.param_groups[1]['lr'] = config.learning_rate * decaying_lr_scale
@@ -1132,8 +1382,12 @@ def train(config: Config):
             xyz0 = GM0._xyz.detach()
             rot0 = GM0._rotation.detach()
             z0 = torch.cat([xyz0, rot0], dim=-1).unsqueeze(0)
+            
+            # Apply annealing noise to z0
+            z0 = apply_annealing_noise(z0, epoch, config)
+            
             processor.func.nfe = 0
-            z_traj = processor(z0, t_span)
+            z_traj = processor(z0, t_span) # num_timesteps x num_points x 13+latent_dim
             
             # Compute photometric loss
             batch_loss = []
@@ -1157,7 +1411,15 @@ def train(config: Config):
                     gt = train_dataset.scenes_data[seq_idx].get_frame(t, slice(0, 10)).to(device)
                     
                     if gt is not None:
-                        timestep_losses.append(compute_loss(render, gt, lpips_model))
+                        # Compute total loss and get components
+                        loss, loss_components = compute_loss(render, gt, lpips_model)
+                        
+                        # Store loss components
+                        epoch_loss_components['mse'].append(loss_components['mse'].item())
+                        epoch_loss_components['ssim'].append(loss_components['ssim'].item())
+                        epoch_loss_components['lpips'].append(loss_components['lpips'].item())
+                        
+                        timestep_losses.append(loss)
                 
                 if timestep_losses:
                     batch_loss.append(torch.mean(torch.stack(timestep_losses)))
@@ -1175,6 +1437,19 @@ def train(config: Config):
                     total_loss = loss
                 
                 total_loss.backward()
+                
+                # Smooth position gradients for each timestep
+                for t in range(len(t_span)):
+                    xyz = z_traj[t, 0, :, :3].detach()  # Get positions for this timestep
+                    if temp_gaussians._xyz.grad is not None:
+                        # Smooth the gradients based on spatial proximity
+                        smoothed_grads = smooth_gradients(
+                            temp_gaussians._xyz.grad,
+                            xyz,
+                            radius=0.1,  # Adjust this value based on your scene scale
+                            num_neighbors=5  # Adjust this value based on your needs
+                        )
+                        temp_gaussians._xyz.grad = smoothed_grads
                 
                 # Calculate gradient norms for monitoring
                 decaying_grad_norm = 0.0
@@ -1205,6 +1480,7 @@ def train(config: Config):
             avg_other_grad_norm = np.mean(other_grad_norms) if other_grad_norms else 0.0
             
             if config.use_wandb:
+                # Log epoch metrics
                 wandb.log({
                     "epoch_loss": avg_loss,
                     "reg_loss": avg_reg_loss,
@@ -1214,7 +1490,11 @@ def train(config: Config):
                     "initial_omega_norm": torch.norm(processor.initial_omega).item(),
                     "decaying_lr_scale": decaying_lr_scale,
                     "decaying_grad_norm": avg_decaying_grad_norm,
-                    "other_grad_norm": avg_other_grad_norm
+                    "other_grad_norm": avg_other_grad_norm,
+                    # Log average loss components for the epoch
+                    "mse_loss": np.mean(epoch_loss_components['mse']),
+                    "ssim_loss": np.mean(epoch_loss_components['ssim']),
+                    "lpips_loss": np.mean(epoch_loss_components['lpips'])
                 }, step=epoch)
             
             # Update progress bar with current loss
@@ -1233,9 +1513,12 @@ def train(config: Config):
                                 background, len(t_span), train_dataset, epoch)
             visualize_loss(train_loader, processor, config, device,
                                 background, len(t_span), train_dataset, epoch)
+            visualize_downscaled_gaussians(train_loader, processor, config, device,
+                                background, len(t_span), train_dataset, epoch)
         
         # Adjust time span (original approach)
-        if epoch % 100 == 0 and epoch > 0:
+        #if epoch % 100 == 0 and epoch > 0:
+        if epoch > 0 and epoch % 100 == 0:
             config.num_timestep_samples += 1
             t_span = torch.linspace(0, config.num_timestep_samples/config.framerate, 
                                     config.num_timestep_samples, device=device)
