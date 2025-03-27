@@ -234,7 +234,7 @@ class ODEFunc(nn.Module):
 class LatentNeuralODE(nn.Module):
     """Latent Neural ODE model with trainable initial conditions."""
     def __init__(self, num_points: int, latent_dim: int = 64, 
-                    atol: float = 1e-4, rtol: float = 1e-3, method: str = 'dopri5'):
+                    atol: float = 1e-5, rtol: float = 1e-3, method: str = 'dopri5'):
         super().__init__()
         self.func = ODEFunc(latent_dim=latent_dim)
         self.encoder = MLP(13, latent_dim)
@@ -627,6 +627,319 @@ def create_side_by_side_video(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
     
     return combined
 
+def map_gradients_to_rgb(gradients: torch.Tensor) -> torch.Tensor:
+    """Map gradient components to RGB colors with magnitude-based intensity.
+    
+    Args:
+        gradients: Tensor of shape [N, 3] containing xyz gradients
+        
+    Returns:
+        Tensor of shape [N, 3] containing RGB colors in [0, 1] range
+    """
+    # Compute magnitude for intensity
+    grad_norm = torch.norm(gradients, dim=1, keepdim=True)
+    grad_norm = torch.clamp(grad_norm, min=1e-6)  # Avoid division by zero
+    
+    # Normalize gradients to [-1, 1] range for direction
+    normalized_grads = gradients / grad_norm
+    
+    # Map to [0, 1] range for color
+    rgb = (normalized_grads + 1) / 2
+    
+    # Scale by magnitude (normalized to [0, 1] range)
+    max_norm = grad_norm.max()
+    min_norm = grad_norm.min()
+    norm_range = max_norm - min_norm
+    if norm_range > 0:
+        intensity = (grad_norm - min_norm) / norm_range
+    else:
+        intensity = torch.ones_like(grad_norm)
+    
+    # Apply intensity to colors
+    rgb = rgb * intensity
+    return rgb
+
+def visualize_gradients(loader: DataLoader, processor: nn.Module, config: Config,
+                    device: torch.device, background: torch.Tensor,
+                    segment_length: int, dataset: GMDataset, step: int) -> Dict[str, Any]:
+    """Generate and log gradient visualization videos."""
+    video_logs = {}
+    batch = next(iter(loader))
+    
+    for i in range(len(batch['GM0'])):
+        scene = batch['scene'][i]
+        GM0 = batch['GM0'][i]
+        
+        # Get initial state
+        xyz0 = GM0._xyz.detach()
+        rot0 = GM0._rotation.detach()
+        
+        # Concatenate position and rotation
+        z0 = torch.cat([xyz0, rot0], dim=-1).unsqueeze(0)  # Shape: [1, num_points, 7]
+        
+        # Generate trajectory
+        z_traj = processor(z0, torch.linspace(
+            0, segment_length/config.framerate, 
+            segment_length, device=device
+        ))[..., :13]
+        
+        # Generate visualization frames with gradient colors
+        grad_frames = []
+        for t in range(segment_length):
+            # Create fresh gaussian model for this timestep
+            temp_gaussians = GM0.clone()
+            
+            # Update gaussians while maintaining gradient connection
+            xyz = z_traj[t, 0, :, :3]
+            quat = F.normalize(z_traj[t, 0, :, 3:7], dim=-1)
+            
+            # Set requires_grad before updating positions
+            temp_gaussians._xyz.requires_grad_(True)
+            
+            # Update positions while maintaining gradient connection
+            temp_gaussians._xyz.data = xyz
+            temp_gaussians._rotation.data = quat
+            
+            # Compute loss for current timestep
+            losses = []
+            for cam_idx in range(10):  # First 10 cameras
+                gt = dataset.scenes_data[i].get_frame(t, cam_idx, for_training=True)
+                if gt is not None:
+                    gt = gt.to(device)
+                    render = render_batch(
+                        [scene.getTrainCameraObjects()[cam_idx]],
+                        temp_gaussians, config.pipeline, background
+                    )["render"]
+                    loss = F.mse_loss(render, gt)
+                    losses.append(loss)
+            
+            if losses:
+                total_loss = torch.mean(torch.stack(losses))
+                total_loss.backward()
+                pos_grads = temp_gaussians._xyz.grad
+                if pos_grads is not None:
+                    grad_colors = map_gradients_to_rgb(pos_grads)
+                    
+                    # Render with gradient colors for first camera only
+                    grad_render = render_batch(
+                        [scene.getTrainCameraObjects()[0]],
+                        temp_gaussians, config.pipeline, background,
+                        override_color=grad_colors
+                    )["render"].squeeze(0).detach().cpu().numpy()
+                    
+                    grad_frames.append(grad_render)
+        
+        if grad_frames:
+            # Stack frames into video
+            grad_video = np.stack(grad_frames)  # [T, 3, H, W]
+            
+            # Scale colors from [0,1] to [0,255] range
+            grad_video = (grad_video * 255).astype(np.uint8)
+            
+            # Log video in wandb format
+            video_logs[f"gradient_visualization_seq{i}"] = wandb.Video(
+                grad_video, fps=config.wandb_fps, format="mp4"
+            )
+    
+    if config.use_wandb:
+        wandb.log(video_logs, step=step)
+    return video_logs
+
+def map_velocities_to_rgb(velocities: torch.Tensor) -> torch.Tensor:
+    """Map velocity components to RGB colors with magnitude-based intensity.
+    
+    Args:
+        velocities: Tensor of shape [N, 3] containing xyz velocities
+        
+    Returns:
+        Tensor of shape [N, 3] containing RGB colors in [0, 1] range
+    """
+    # Compute magnitude for intensity
+    vel_norm = torch.norm(velocities, dim=1, keepdim=True)
+    vel_norm = torch.clamp(vel_norm, min=1e-6)  # Avoid division by zero
+    
+    # Normalize velocities to [-1, 1] range for direction
+    normalized_vels = velocities / vel_norm
+    
+    # Map to [0, 1] range for color
+    rgb = (normalized_vels + 1) / 2
+    
+    # Scale by magnitude (normalized to [0, 1] range)
+    max_norm = vel_norm.max()
+    min_norm = vel_norm.min()
+    norm_range = max_norm - min_norm
+    if norm_range > 0:
+        intensity = (vel_norm - min_norm) / norm_range
+    else:
+        intensity = torch.ones_like(vel_norm)
+    
+    # Apply intensity to colors
+    rgb = rgb * intensity
+    return rgb
+
+def visualize_velocities(loader: DataLoader, processor: nn.Module, config: Config,
+                    device: torch.device, background: torch.Tensor,
+                    segment_length: int, dataset: GMDataset, step: int) -> Dict[str, Any]:
+    """Generate and log velocity visualization videos."""
+    video_logs = {}
+    batch = next(iter(loader))
+    
+    for i in range(len(batch['GM0'])):
+        scene = batch['scene'][i]
+        GM0 = batch['GM0'][i]
+        
+        # Get initial state
+        xyz0 = GM0._xyz.detach()
+        rot0 = GM0._rotation.detach()
+        
+        # Concatenate position and rotation
+        z0 = torch.cat([xyz0, rot0], dim=-1).unsqueeze(0)  # Shape: [1, num_points, 7]
+        
+        # Generate trajectory
+        z_traj = processor(z0, torch.linspace(
+            0, segment_length/config.framerate, 
+            segment_length, device=device
+        ))[..., :13]
+        
+        # Generate visualization frames with velocity colors
+        vel_frames = []
+        for t in range(segment_length):
+            # Create fresh gaussian model for this timestep
+            temp_gaussians = GM0.clone()
+            
+            # Update gaussians
+            xyz = z_traj[t, 0, :, :3]
+            quat = F.normalize(z_traj[t, 0, :, 3:7], dim=-1)
+            vel = z_traj[t, 0, :, 7:10]  # Get velocities
+            
+            # Update positions
+            temp_gaussians._xyz.data = xyz
+            temp_gaussians._rotation.data = quat
+            
+            # Map velocities to colors
+            vel_colors = map_velocities_to_rgb(vel)
+            
+            # Render with velocity colors for first camera only
+            vel_render = render_batch(
+                [scene.getTrainCameraObjects()[0]],
+                temp_gaussians, config.pipeline, background,
+                override_color=vel_colors
+            )["render"].squeeze(0).detach().cpu().numpy()
+            
+            vel_frames.append(vel_render)
+        
+        if vel_frames:
+            # Stack frames into video
+            vel_video = np.stack(vel_frames)  # [T, 3, H, W]
+            
+            # Scale colors from [0,1] to [0,255] range
+            vel_video = (vel_video * 255).astype(np.uint8)
+            
+            # Log video in wandb format
+            video_logs[f"velocity_visualization_seq{i}"] = wandb.Video(
+                vel_video, fps=config.wandb_fps, format="mp4"
+            )
+    
+    if config.use_wandb:
+        wandb.log(video_logs, step=step)
+    return video_logs
+
+def visualize_loss(loader: DataLoader, processor: nn.Module, config: Config,
+                    device: torch.device, background: torch.Tensor,
+                    segment_length: int, dataset: GMDataset, step: int) -> Dict[str, Any]:
+    """Generate and log per-pixel loss visualization videos for the first camera."""
+    video_logs = {}
+    batch = next(iter(loader))
+    
+    for i in range(len(batch['GM0'])):
+        scene = batch['scene'][i]
+        GM0 = batch['GM0'][i]
+        
+        # Get initial state
+        xyz0 = GM0._xyz.detach()
+        rot0 = GM0._rotation.detach()
+        
+        # Concatenate position and rotation
+        z0 = torch.cat([xyz0, rot0], dim=-1).unsqueeze(0)  # Shape: [1, num_points, 7]
+        
+        # Generate trajectory
+        z_traj = processor(z0, torch.linspace(
+            0, segment_length/config.framerate, 
+            segment_length, device=device
+        ))[..., :13]
+        
+        # Get ground truth frames for first camera
+        gt_frames = []
+        for t in range(segment_length):
+            gt = dataset.scenes_data[i].get_frame(t, 0, for_training=True)
+            if gt is not None:
+                gt_frames.append(gt)
+        
+        if gt_frames:
+            gt_video = torch.stack(gt_frames).to(device)  # [T, 3, H, W]
+            
+            # Generate visualization frames with loss values
+            loss_frames = []
+            for t in range(segment_length):
+                # Create fresh gaussian model for this timestep
+                temp_gaussians = GM0.clone()
+                
+                # Update gaussians
+                xyz = z_traj[t, 0, :, :3]
+                quat = F.normalize(z_traj[t, 0, :, 3:7], dim=-1)
+                
+                # Update positions
+                temp_gaussians._xyz.data = xyz
+                temp_gaussians._rotation.data = quat
+                
+                # Render for first camera
+                render = render_batch(
+                    [scene.getTrainCameraObjects()[0]],
+                    temp_gaussians, config.pipeline, background
+                )["render"]
+                
+                # Compute per-pixel loss
+                per_pixel_loss = F.mse_loss(render, gt_video[t], reduction='none')
+                
+                # Average across channels to get grayscale loss
+                grayscale_loss = per_pixel_loss.mean(dim=0)  # [H, W]
+                
+                # Normalize loss to [0, 1] range
+                max_loss = grayscale_loss.max()
+                min_loss = grayscale_loss.min()
+                loss_range = max_loss - min_loss
+                if loss_range > 0:
+                    normalized_loss = (grayscale_loss - min_loss) / loss_range
+                else:
+                    normalized_loss = torch.zeros_like(grayscale_loss)
+                
+                # Convert to numpy and create RGB frame
+                loss_frame = normalized_loss.detach().cpu().numpy()
+                #loss_frame = np.repeat(loss_frame[None, ...], 3, axis=0)  # [3, H, W]
+                
+                # Convert to uint8 in [0, 255] range
+                loss_frame = (loss_frame * 255).astype(np.uint8)
+                
+                # Transpose to [H, W, 3] format for wandb
+                # loss_frame = loss_frame.transpose(1, 2, 0)
+                
+                loss_frames.append(loss_frame)
+            
+            if loss_frames:
+                # Stack frames into video
+                loss_video = np.stack(loss_frames)  # [T, H, W, 3]
+                # Transpose from [T, H, W, 3] to [T, 3, H, W] format
+                # loss_video = loss_video.transpose(0, 3, 1, 2)  # [T, 3, H, W]
+                
+                # Log video in wandb format
+                video_logs[f"loss_visualization_seq{i}"] = wandb.Video(
+                    loss_video, fps=config.wandb_fps, format="mp4"
+                )
+    
+    if config.use_wandb:
+        wandb.log(video_logs, step=step)
+    return video_logs
+
 # --------------------------
 # Training Loop
 # --------------------------
@@ -635,7 +948,7 @@ def train(config: Config):
     device = torch.device(config.device)
     background = torch.tensor([0, 0, 0], dtype=torch.float32, device=device)
     t_span = torch.linspace(0, config.num_timestep_samples/config.framerate, 
-                           config.num_timestep_samples, device=device)
+                            config.num_timestep_samples, device=device)
     
     # Initialize datasets
     train_dataset = GMDataset(config, config.num_train_sequences, f"{config.dataset_path}/train")
@@ -791,13 +1104,18 @@ def train(config: Config):
             # Update progress bar with current loss
             pbar.set_postfix({
                 'loss': f'{avg_loss:.6f}', 
-                #'reg': f'{avg_reg_loss:.6f}', 
                 'nfe': f'{processor.func.nfe}'
             })
         
         # Visualization
         if epoch % config.train_visualization_interval == 0:
             visualize_results(train_loader, processor, config, device, 
+                                background, len(t_span), train_dataset, epoch)
+            visualize_gradients(train_loader, processor, config, device,
+                                background, len(t_span), train_dataset, epoch)
+            visualize_velocities(train_loader, processor, config, device,
+                                background, len(t_span), train_dataset, epoch)
+            visualize_loss(train_loader, processor, config, device,
                                 background, len(t_span), train_dataset, epoch)
         
         # Adjust time span (original approach)
