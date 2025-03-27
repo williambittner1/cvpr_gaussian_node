@@ -661,7 +661,7 @@ def map_gradients_to_rgb(gradients: torch.Tensor) -> torch.Tensor:
 
 def visualize_gradients(loader: DataLoader, processor: nn.Module, config: Config,
                     device: torch.device, background: torch.Tensor,
-                    segment_length: int, dataset: GMDataset, step: int) -> Dict[str, Any]:
+                    segment_length: int, dataset: GMDataset, step: int, lpips_model: Optional[nn.Module] = None) -> Dict[str, Any]:
     """Generate and log gradient visualization videos."""
     video_logs = {}
     batch = next(iter(loader))
@@ -685,6 +685,12 @@ def visualize_gradients(loader: DataLoader, processor: nn.Module, config: Config
         
         # Generate visualization frames with gradient colors
         grad_frames = []
+        loss_components = {
+            'mse': [],
+            'ssim': [],
+            'lpips': []
+        }
+        
         for t in range(segment_length):
             # Create fresh gaussian model for this timestep
             temp_gaussians = GM0.clone()
@@ -710,7 +716,19 @@ def visualize_gradients(loader: DataLoader, processor: nn.Module, config: Config
                         [scene.getTrainCameraObjects()[cam_idx]],
                         temp_gaussians, config.pipeline, background
                     )["render"]
-                    loss = F.mse_loss(render, gt)
+                    
+                    # Compute individual loss components
+                    mse_loss = F.mse_loss(render, gt)
+                    ssim_loss = compute_ssim_loss(render, gt)
+                    lpips_loss = compute_lpips_loss(render, gt, lpips_model) if lpips_model is not None else torch.tensor(0.0, device=device)
+                    
+                    # Store loss components
+                    loss_components['mse'].append(mse_loss.item())
+                    loss_components['ssim'].append(ssim_loss.item())
+                    loss_components['lpips'].append(lpips_loss.item())
+                    
+                    # Compute total loss
+                    loss = compute_loss(render, gt, lpips_model)
                     losses.append(loss)
             
             if losses:
@@ -740,6 +758,14 @@ def visualize_gradients(loader: DataLoader, processor: nn.Module, config: Config
             video_logs[f"gradient_visualization_seq{i}"] = wandb.Video(
                 grad_video, fps=config.wandb_fps, format="mp4"
             )
+            
+            # Log average loss components
+            if config.use_wandb:
+                wandb.log({
+                    f"gradient_mse_loss_seq{i}": np.mean(loss_components['mse']),
+                    f"gradient_ssim_loss_seq{i}": np.mean(loss_components['ssim']),
+                    f"gradient_lpips_loss_seq{i}": np.mean(loss_components['lpips'])
+                }, step=step)
     
     if config.use_wandb:
         wandb.log(video_logs, step=step)
@@ -844,6 +870,99 @@ def visualize_velocities(loader: DataLoader, processor: nn.Module, config: Confi
         wandb.log(video_logs, step=step)
     return video_logs
 
+def compute_ssim_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Compute SSIM loss between predicted and ground truth images.
+    
+    Args:
+        pred: Predicted image tensor of shape [B, C, H, W] or [C, H, W]
+        gt: Ground truth image tensor of shape [B, C, H, W] or [C, H, W]
+        
+    Returns:
+        SSIM loss tensor (1 - SSIM)
+    """
+    # Ensure input is in [0, 1] range
+    pred = torch.clamp(pred, 0, 1)
+    gt = torch.clamp(gt, 0, 1)
+    
+    # Compute SSIM
+    ssim = F.cosine_similarity(pred, gt, dim=1)
+    return 1 - ssim.mean()
+
+def compute_lpips_loss(pred: torch.Tensor, gt: torch.Tensor, lpips_model: nn.Module) -> torch.Tensor:
+    """Compute LPIPS loss between predicted and ground truth images.
+    
+    Args:
+        pred: Predicted image tensor of shape [B, C, H, W] or [C, H, W]
+        gt: Ground truth image tensor of shape [B, C, H, W] or [C, H, W]
+        lpips_model: Pre-trained LPIPS model
+        
+    Returns:
+        LPIPS loss tensor
+    """
+    # Ensure input is in [-1, 1] range for LPIPS
+    pred = 2 * pred - 1
+    gt = 2 * gt - 1
+    
+    # Compute LPIPS loss
+    return lpips_model(pred, gt).mean()
+
+def compute_loss(pred: torch.Tensor, gt: torch.Tensor, lpips_model: Optional[nn.Module] = None,
+                reduction: str = 'mean', weights: Optional[Dict[str, float]] = None) -> torch.Tensor:
+    """Compute combined loss between predicted and ground truth images.
+    
+    Args:
+        pred: Predicted image tensor of shape [B, C, H, W] or [C, H, W]
+        gt: Ground truth image tensor of shape [B, C, H, W] or [C, H, W]
+        lpips_model: Optional pre-trained LPIPS model
+        reduction: Reduction method for the loss ('mean', 'none', or 'sum')
+        weights: Optional dictionary of loss weights
+        
+    Returns:
+        Combined loss tensor
+    """
+    # Default weights if not provided
+    if weights is None:
+        weights = {
+            'mse': 1.0,      # MSE is already small (0.0002)
+            'ssim': 0.001,   # Scale down SSIM (0.75) to match MSE scale
+            'lpips': 0.04    # Scale down LPIPS (0.0052) to match MSE scale
+        }
+    
+    # MSE loss
+    mse_loss = F.mse_loss(pred, gt, reduction=reduction)
+    
+    # SSIM loss
+    ssim_loss = compute_ssim_loss(pred, gt)
+    
+    # LPIPS loss if model is provided
+    lpips_loss = torch.tensor(0.0, device=pred.device)
+    if lpips_model is not None:
+        lpips_loss = compute_lpips_loss(pred, gt, lpips_model)
+    
+    # Combine losses with weights
+    total_loss = (
+        weights['mse'] * mse_loss +
+        weights['ssim'] * ssim_loss +
+        weights['lpips'] * lpips_loss
+    )
+    
+    return total_loss
+
+def compute_per_pixel_loss(pred: torch.Tensor, gt: torch.Tensor, lpips_model: Optional[nn.Module] = None) -> torch.Tensor:
+    """Compute per-pixel combined loss between predicted and ground truth images.
+    
+    Args:
+        pred: Predicted image tensor of shape [B, C, H, W] or [C, H, W]
+        gt: Ground truth image tensor of shape [B, C, H, W] or [C, H, W]
+        lpips_model: Optional pre-trained LPIPS model
+        
+    Returns:
+        Per-pixel loss tensor of shape [H, W] (averaged across channels)
+    """
+    # For per-pixel loss, we only use MSE as other losses are global
+    per_pixel_loss = F.mse_loss(pred, gt, reduction='none')
+    return per_pixel_loss.mean(dim=0)  # Average across channels
+
 def visualize_loss(loader: DataLoader, processor: nn.Module, config: Config,
                     device: torch.device, background: torch.Tensor,
                     segment_length: int, dataset: GMDataset, step: int) -> Dict[str, Any]:
@@ -899,10 +1018,7 @@ def visualize_loss(loader: DataLoader, processor: nn.Module, config: Config,
                 )["render"]
                 
                 # Compute per-pixel loss
-                per_pixel_loss = F.mse_loss(render, gt_video[t], reduction='none')
-                
-                # Average across channels to get grayscale loss
-                grayscale_loss = per_pixel_loss.mean(dim=0)  # [H, W]
+                grayscale_loss = compute_per_pixel_loss(render, gt_video[t])
                 
                 # Normalize loss to [0, 1] range
                 max_loss = grayscale_loss.max()
@@ -915,21 +1031,15 @@ def visualize_loss(loader: DataLoader, processor: nn.Module, config: Config,
                 
                 # Convert to numpy and create RGB frame
                 loss_frame = normalized_loss.detach().cpu().numpy()
-                #loss_frame = np.repeat(loss_frame[None, ...], 3, axis=0)  # [3, H, W]
                 
                 # Convert to uint8 in [0, 255] range
                 loss_frame = (loss_frame * 255).astype(np.uint8)
-                
-                # Transpose to [H, W, 3] format for wandb
-                # loss_frame = loss_frame.transpose(1, 2, 0)
                 
                 loss_frames.append(loss_frame)
             
             if loss_frames:
                 # Stack frames into video
                 loss_video = np.stack(loss_frames)  # [T, H, W, 3]
-                # Transpose from [T, H, W, 3] to [T, 3, H, W] format
-                # loss_video = loss_video.transpose(0, 3, 1, 2)  # [T, 3, H, W]
                 
                 # Log video in wandb format
                 video_logs[f"loss_visualization_seq{i}"] = wandb.Video(
@@ -969,6 +1079,14 @@ def train(config: Config):
         method=config.ode_method
     ).to(device)
     
+    # Initialize LPIPS model if available
+    try:
+        import lpips
+        lpips_model = lpips.LPIPS(net='alex').to(device)
+    except ImportError:
+        print("LPIPS not available. Will use only MSE and SSIM losses.")
+        lpips_model = None
+    
     # Create parameter groups for different learning rates
     decaying_parameters = [processor.initial_velocity, processor.initial_omega]
     decaying_param_ids = [id(p) for p in decaying_parameters]
@@ -982,7 +1100,7 @@ def train(config: Config):
     
     # Initialize wandb if enabled
     if config.use_wandb:
-        wandb.init(project="latent_node", name=config.wandb_name, config=config.__dict__)
+        wandb.init(project="latent_node", config=config.__dict__)
     
     # Create progress bar for epochs with loss display
     pbar = tqdm(range(config.epochs), desc="Training", 
@@ -1004,7 +1122,6 @@ def train(config: Config):
         
         # Update learning rate for decaying parameters
         decaying_lr_scale *= config.decaying_params_lr_decay
-        # Update the second parameter group (index 1), which contains our decaying parameters
         optimizer.param_groups[1]['lr'] = config.learning_rate * decaying_lr_scale
         
         for batch in train_loader:
@@ -1014,8 +1131,7 @@ def train(config: Config):
             GM0 = batch['GM0'][0]  # Use first sequence's static model
             xyz0 = GM0._xyz.detach()
             rot0 = GM0._rotation.detach()
-            # Reshape to include batch dimension
-            z0 = torch.cat([xyz0, rot0], dim=-1).unsqueeze(0)  # Shape: [1, num_points, dim]
+            z0 = torch.cat([xyz0, rot0], dim=-1).unsqueeze(0)
             processor.func.nfe = 0
             z_traj = processor(z0, t_span)
             
@@ -1041,7 +1157,7 @@ def train(config: Config):
                     gt = train_dataset.scenes_data[seq_idx].get_frame(t, slice(0, 10)).to(device)
                     
                     if gt is not None:
-                        timestep_losses.append(F.mse_loss(render, gt))
+                        timestep_losses.append(compute_loss(render, gt, lpips_model))
                 
                 if timestep_losses:
                     batch_loss.append(torch.mean(torch.stack(timestep_losses)))
@@ -1112,14 +1228,14 @@ def train(config: Config):
             visualize_results(train_loader, processor, config, device, 
                                 background, len(t_span), train_dataset, epoch)
             visualize_gradients(train_loader, processor, config, device,
-                                background, len(t_span), train_dataset, epoch)
+                                background, len(t_span), train_dataset, epoch, lpips_model)
             visualize_velocities(train_loader, processor, config, device,
                                 background, len(t_span), train_dataset, epoch)
             visualize_loss(train_loader, processor, config, device,
                                 background, len(t_span), train_dataset, epoch)
         
         # Adjust time span (original approach)
-        if epoch % 200 == 0 and epoch > 0:
+        if epoch % 100 == 0 and epoch > 0:
             config.num_timestep_samples += 1
             t_span = torch.linspace(0, config.num_timestep_samples/config.framerate, 
                                     config.num_timestep_samples, device=device)
