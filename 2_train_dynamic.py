@@ -55,7 +55,7 @@ class Config:
         self.decaying_params_lr_decay = 0.999  # Exponential decay factor per epoch
         
         # Gradient clipping and regularization
-        self.grad_clip_value = 0.01
+        self.grad_clip_value = 0.2
         # self.reg_weight = 0.001
         
         # ODE solver configuration
@@ -64,7 +64,7 @@ class Config:
         self.ode_atol = 1e-4
         
         # Visualization
-        self.train_visualization_interval = 50
+        self.train_visualization_interval = 250
         self.test_visualization_interval = 100
         self.test_loss_interval = 100
         
@@ -80,8 +80,8 @@ class Config:
         self.rigidity_neighbors = 3
         
         # Annealing noise parameters
-        self.noise_scale = .01  # Scaling factor Nε for annealing noise
-        self.noise_end_iter = 10000  # Iteration at which noise reaches zero
+        self.noise_scale = 1  # Scaling factor Nε for annealing noise
+        self.noise_end_iter = 2000  # Iteration at which noise reaches zero
         
         # Logging
         self.use_wandb = True  # Flag to control wandb usage
@@ -158,7 +158,7 @@ class QuaternionOps:
             cos_half,
             sin_half * omega_norm[..., 0:1],
             sin_half * omega_norm[..., 1:2],
-            sin_half * omega_norm[..., 2:3]
+            sin_half * omega_norm[..., 2:3],
         ], dim=-1)
         
         # For very small angles, use first-order approximation
@@ -264,15 +264,17 @@ class ResidualMLP(nn.Module):
 # --------------------------
 class ODEFunc(nn.Module):
     """Neural ODE function."""
-    def __init__(self, latent_dim: int = 128, num_layers: int = 4, hidden_dim: int = 256):
+    def __init__(self, latent_dim: int = 128, num_layers: int = 4, hidden_dim: int = 256, config: Config = None):
         super().__init__()
         self.nfe = 0
         
         # Single unified network for both velocity and angular velocity
-        self.dynamics_net = ResidualMLP(13+latent_dim + 1, 6, hidden_dim=hidden_dim, num_layers=num_layers)
+        self.dynamics_net = ResidualMLP(13 + latent_dim + 1, 6, hidden_dim=hidden_dim, num_layers=num_layers)
         
         # Regularization terms
         self.reg_loss = 0.0
+        self.iteration = 0
+        self.config = config
         
     def forward(self, t: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         """
@@ -284,8 +286,9 @@ class ODEFunc(nn.Module):
         
         # Normalize quaternions
         quat = z[..., 3:7].clone()
-        quat = F.normalize(quat, p=2, dim=-1)
+        # quat = F.normalize(quat, p=2, dim=-1)
         z = torch.cat([z[..., :3], quat, z[..., 7:]], dim=-1)
+        # z = apply_annealing_noise(z, self.iteration, self.config)
         
         # Compute derivatives
         t_expanded = t.view(-1, 1, 1).expand(batch_size, num_points, 1)
@@ -319,21 +322,21 @@ class ODEFunc(nn.Module):
 class LatentNeuralODE(nn.Module):
     """Latent Neural ODE model with trainable initial conditions."""
     def __init__(self, num_points: int, latent_dim: int = 64, 
-                    atol: float = 1e-5, rtol: float = 1e-3, method: str = 'dopri5'):
+                    atol: float = 1e-5, rtol: float = 1e-3, method: str = 'dopri5', config: Config = None):
         super().__init__()
-        self.func = ODEFunc(latent_dim=latent_dim)
+        self.func = ODEFunc(latent_dim=latent_dim, config=config)
         self.encoder = MLP(13, latent_dim)
         self.atol = atol
         self.rtol = rtol
         self.method = method
-        
+        self.config = config
         # Trainable initial conditions for each point
         self.initial_position_offset = nn.Parameter(torch.zeros(num_points, 3))
         self.initial_rotation_offset = nn.Parameter(torch.zeros(num_points, 4))
         self.initial_velocity = nn.Parameter(torch.zeros(num_points, 3))
         self.initial_omega = nn.Parameter(torch.zeros(num_points, 3))
         
-    def forward(self, z0: torch.Tensor, t_span: torch.Tensor) -> torch.Tensor:
+    def forward(self, z0: torch.Tensor, t_span: torch.Tensor, iteration: int = 0) -> torch.Tensor:
         """Forward pass through the ODE solver.
         
         Args:
@@ -357,14 +360,17 @@ class LatentNeuralODE(nn.Module):
             v0,  # Trainable initial velocity [1, num_points, 3]
             w0,  # Trainable initial angular velocity [1, num_points, 3]
         ], dim=-1)
+
         
         # Add latent encoding
         z0_encoded = self.encoder(z0)
         z0 = torch.cat([z0, z0_encoded], dim=-1)
+        # z0 = apply_annealing_noise(z0, iteration, self.config)
         
         z_traj = odeint(self.func, z0, t_span, 
                         method=self.method, atol=self.atol, rtol=self.rtol,
                         options={'max_num_steps': 1000})  # Add explicit maximum steps for adaptive methods
+        self.func.iteration += 1
         return z_traj # xyz(0:3), quat(3:7), vel(7:10), omega(10:13), latent(13:)
 
 # --------------------------
@@ -717,21 +723,26 @@ def create_side_by_side_video(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
     
     return combined
 
-def map_gradients_to_rgb(gradients: torch.Tensor) -> torch.Tensor:
-    """Map gradient components to RGB colors with magnitude-based intensity.
+def map_gradients_to_rgb(gradients: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Map gradient components to RGB colors with magnitude-based intensity, normalized by Gaussian scales.
     
     Args:
         gradients: Tensor of shape [N, 3] containing xyz gradients
+        scales: Tensor of shape [N, 3] containing xyz scales of Gaussians
         
     Returns:
         Tensor of shape [N, 3] containing RGB colors in [0, 1] range
     """
+    # Normalize gradients by scales
+    scale_norm = torch.norm(scales, dim=1, keepdim=True)
+    normalized_grads = gradients / (scale_norm + 1e-6)  # Add epsilon to avoid division by zero
+    
     # Compute magnitude for intensity
-    grad_norm = torch.norm(gradients, dim=1, keepdim=True)
+    grad_norm = torch.norm(normalized_grads, dim=1, keepdim=True)
     grad_norm = torch.clamp(grad_norm, min=1e-6)  # Avoid division by zero
     
     # Normalize gradients to [-1, 1] range for direction
-    normalized_grads = gradients / grad_norm
+    normalized_grads = normalized_grads / grad_norm
     
     # Map to [0, 1] range for color
     rgb = (normalized_grads + 1) / 2
@@ -746,7 +757,7 @@ def map_gradients_to_rgb(gradients: torch.Tensor) -> torch.Tensor:
         intensity = torch.ones_like(grad_norm)
     
     # Apply intensity to colors
-    rgb = rgb * intensity
+    rgb = rgb * intensity * 100
     return rgb
 
 def log_loss_components(loss_components: Dict[str, List[float]], seq_idx: int, step: int, config: Config):
@@ -875,20 +886,24 @@ def visualize_gradients(loader: DataLoader, processor: nn.Module, config: Config
                 total_loss.backward()
                 pos_grads = temp_gaussians._xyz.grad
                 if pos_grads is not None:
-                    # Smooth the gradients based on spatial proximity
-                    smoothed_grads = smooth_gradients(
-                        pos_grads,
-                        xyz,
-                        radius=0.1,  # Adjust this value based on your scene scale
-                        num_neighbors=5  # Adjust this value based on your needs
-                    )
-                    temp_gaussians._xyz.grad = smoothed_grads
+                    # Get Gaussian scales
+                    scales = temp_gaussians.get_scaling.detach()
                     
-                    # Render with gradient colors for first camera only
+                    # Smooth the gradients based on spatial proximity
+                    # smoothed_grads = smooth_gradients(
+                    #     pos_grads,
+                    #     xyz,
+                    #     radius=0.1,  # Adjust this value based on your scene scale
+                    #     num_neighbors=5  # Adjust this value based on your needs
+                    # )
+                    # temp_gaussians._xyz.grad = smoothed_grads
+                    
+                    # Render with gradient colors normalized by scales
+                    grad_colors = map_gradients_to_rgb(pos_grads, scales)
                     grad_render = render_batch(
                         [scene.getTrainCameraObjects()[0]],
                         temp_gaussians, config.pipeline, background,
-                        override_color=map_gradients_to_rgb(smoothed_grads)
+                        override_color=grad_colors  # Colors in [0, 1]
                     )["render"].squeeze(0).detach().cpu().numpy()
                     
                     grad_frames.append(grad_render)
@@ -897,7 +912,7 @@ def visualize_gradients(loader: DataLoader, processor: nn.Module, config: Config
             # Stack frames into video
             grad_video = np.stack(grad_frames)  # [T, 3, H, W]
             
-            # Scale colors from [0,1] to [0,255] range
+            # Convert to uint8 in [0, 255] range for video
             grad_video = (grad_video * 255).astype(np.uint8)
             
             # Log video in wandb format
@@ -1319,7 +1334,8 @@ def train(config: Config):
         latent_dim=64,
         atol=config.ode_atol,
         rtol=config.ode_rtol,
-        method=config.ode_method
+        method=config.ode_method,
+        config=config
     ).to(device)
     
     # Initialize LPIPS model if available
@@ -1331,7 +1347,7 @@ def train(config: Config):
         lpips_model = None
     
     # Create parameter groups for different learning rates
-    decaying_parameters = [processor.initial_velocity, processor.initial_omega]
+    decaying_parameters = [processor.initial_velocity, processor.initial_omega]#, processor.initial_position_offset, processor.initial_rotation_offset]
     decaying_param_ids = [id(p) for p in decaying_parameters]
     other_params = [p for p in processor.parameters() if id(p) not in decaying_param_ids]
     
@@ -1383,11 +1399,9 @@ def train(config: Config):
             rot0 = GM0._rotation.detach()
             z0 = torch.cat([xyz0, rot0], dim=-1).unsqueeze(0)
             
-            # Apply annealing noise to z0
-            z0 = apply_annealing_noise(z0, epoch, config)
             
             processor.func.nfe = 0
-            z_traj = processor(z0, t_span) # num_timesteps x num_points x 13+latent_dim
+            z_traj = processor(z0, t_span, epoch) # num_timesteps x num_points x 13+latent_dim
             
             # Compute photometric loss
             batch_loss = []
@@ -1439,17 +1453,17 @@ def train(config: Config):
                 total_loss.backward()
                 
                 # Smooth position gradients for each timestep
-                for t in range(len(t_span)):
-                    xyz = z_traj[t, 0, :, :3].detach()  # Get positions for this timestep
-                    if temp_gaussians._xyz.grad is not None:
-                        # Smooth the gradients based on spatial proximity
-                        smoothed_grads = smooth_gradients(
-                            temp_gaussians._xyz.grad,
-                            xyz,
-                            radius=0.1,  # Adjust this value based on your scene scale
-                            num_neighbors=5  # Adjust this value based on your needs
-                        )
-                        temp_gaussians._xyz.grad = smoothed_grads
+                # for t in range(len(t_span)):
+                #     xyz = z_traj[t, 0, :, :3].detach()  # Get positions for this timestep
+                #     if temp_gaussians._xyz.grad is not None:
+                #         # Smooth the gradients based on spatial proximity
+                #         smoothed_grads = smooth_gradients(
+                #             temp_gaussians._xyz.grad,
+                #             xyz,
+                #             radius=0.1,  # Adjust this value based on your scene scale
+                #             num_neighbors=5  # Adjust this value based on your needs
+                #         )
+                #         temp_gaussians._xyz.grad = smoothed_grads
                 
                 # Calculate gradient norms for monitoring
                 decaying_grad_norm = 0.0
@@ -1518,7 +1532,7 @@ def train(config: Config):
         
         # Adjust time span (original approach)
         #if epoch % 100 == 0 and epoch > 0:
-        if epoch > 0 and epoch % 100 == 0:
+        if epoch > 0 and epoch % 200 == 0:
             config.num_timestep_samples += 1
             t_span = torch.linspace(0, config.num_timestep_samples/config.framerate, 
                                     config.num_timestep_samples, device=device)
